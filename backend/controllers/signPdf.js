@@ -1,137 +1,103 @@
-// controllers/signPdf.js
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const { PDFDocument } = require("pdf-lib");
-const Document = require("../models/Document");
+const { PDFDocument, rgb } = require("pdf-lib");
 
+/**
+ * POST /api/sign-pdf
+ * Required payload:
+ * {
+ *   pdfId: "sample-a4",
+ *   signatureImage: "data:image/png;base64,...",
+ *   fields: [
+ *     {
+ *       type: "signature",
+ *       page: 1,
+ *       xNorm: 0.20,
+ *       yNormTop: 0.55,
+ *       wNorm: 0.30,
+ *       hNorm: 0.10
+ *     }
+ *   ]
+ * }
+ */
 module.exports = async function signPdf(req, res) {
   try {
-    const { pdfId, fields, signatureImage } = req.body;
+    console.log("📩 HIT SIGN ROUTE");
+    const { pdfId, signatureImage, fields } = req.body;
 
-    if (!pdfId || !fields || !Array.isArray(fields) || fields.length === 0) {
-      return res.status(400).json({ message: "pdfId and fields are required" });
+    if (!pdfId || !signatureImage || !fields) {
+      return res.status(400).json({ success: false, message: "Missing payload fields" });
     }
 
-    if (!signatureImage) {
-      return res.status(400).json({ message: "signatureImage is required" });
-    }
-
-    // 1️⃣ Load original PDF
-    const pdfPath = path.join(__dirname, "..", "pdfs", `${pdfId}.pdf`);
-
+    // ----------- LOAD PDF TEMPLATE -----------
+    const pdfPath = path.join(__dirname, "../pdfs", `${pdfId}.pdf`);
     if (!fs.existsSync(pdfPath)) {
-      return res.status(404).json({ message: "PDF template not found" });
+      return res.status(404).json({ success: false, message: "PDF template not found" });
     }
 
-    const originalPdfBytes = fs.readFileSync(pdfPath);
+    const existingPdfBytes = fs.readFileSync(pdfPath);
+    const originalHash = crypto.createHash("sha256").update(existingPdfBytes).digest("hex");
 
-    // 2️⃣ Hash original PDF (before signing)
-    const originalHash = crypto
-      .createHash("sha256")
-      .update(originalPdfBytes)
-      .digest("hex");
+    const pdfDoc = await PDFDocument.load(existingPdfBytes);
 
-    // 3️⃣ Load PDF with pdf-lib
-    const pdfDoc = await PDFDocument.load(originalPdfBytes);
-    const pages = pdfDoc.getPages();
+    // ----------- PROCESS EACH FIELD -----------
+    for (const field of fields) {
+      if (field.type === "signature") {
+        console.log("✍️ Embedding signature…");
 
-    // For now, just handle first signature field (you can loop later)
-    const field = fields[0];
+        const pngBase64 = signatureImage.replace(/^data:image\/png;base64,/, "");
+        const pngBytes = Buffer.from(pngBase64, "base64");
+        const pngImage = await pdfDoc.embedPng(pngBytes);
 
-    const pageIndex = (field.page || 1) - 1;
-    if (!pages[pageIndex]) {
-      return res.status(400).json({ message: "Invalid page index" });
-    }
-    const page = pages[pageIndex];
+        const { width: pdfW, height: pdfH } = pdfDoc.getPage(field.page - 1).getSize();
 
-    const { width: pageWidthPt, height: pageHeightPt } = page.getSize();
+        // Convert normalized units into PDF coordinates
+        const x = field.xNorm * pdfW;
+        const w = field.wNorm * pdfW;
 
-    // 4️⃣ Convert normalized coords → PDF points
-    const { xNorm, yNormTop, wNorm, hNorm } = field;
+        const h = field.hNorm * pdfH;
+        const yFromTop = field.yNormTop * pdfH;
+        const y = pdfH - yFromTop - h;  // Convert browser → PDF coords
 
-    if (
-      [xNorm, yNormTop, wNorm, hNorm].some(
-        (v) => typeof v !== "number" || v < 0 || v > 1
-      )
-    ) {
-      return res
-        .status(400)
-        .json({ message: "Invalid normalized coordinates" });
-    }
+        // Draw signature
+        pdfDoc.getPage(field.page - 1).drawImage(pngImage, {
+          x,
+          y,
+          width: w,
+          height: h
+        });
 
-    const wBoxPt = wNorm * pageWidthPt;
-    const hBoxPt = hNorm * pageHeightPt;
-    const xPt = xNorm * pageWidthPt;
-
-    // y from top → y from bottom
-    const yTopPt = yNormTop * pageHeightPt;
-    const yPt = pageHeightPt - (yTopPt + hBoxPt);
-
-    // 5️⃣ Decode base64 signature image
-    let base64Data = signatureImage;
-    const commaIndex = base64Data.indexOf(",");
-    if (commaIndex !== -1) {
-      base64Data = base64Data.slice(commaIndex + 1);
+        console.log("👉 Final coords:", { x, y, w, h });
+      }
     }
 
-    const sigBytes = Buffer.from(base64Data, "base64");
+    // ----------- SAVE SIGNED PDF -----------
+    const pdfBytes = await pdfDoc.save();
+    const signedHash = crypto.createHash("sha256").update(pdfBytes).digest("hex");
 
-    // Assume PNG for now; you can conditionally choose JPG/PNG based on data URL
-    const sigImage = await pdfDoc.embedPng(sigBytes);
+    const signedFileName = `${pdfId}-${Date.now()}.pdf`;
+    const signedDir = path.join(__dirname, "../signed");
+    if (!fs.existsSync(signedDir)) fs.mkdirSync(signedDir);
 
-    const imgW = sigImage.width;
-    const imgH = sigImage.height;
+    const signedPath = path.join(signedDir, signedFileName);
+    fs.writeFileSync(signedPath, pdfBytes);
 
-    // 6️⃣ Aspect ratio: contain image inside box, no stretch
-    const scale = Math.min(wBoxPt / imgW, hBoxPt / imgH);
+    // ----------- BUILD PUBLIC URL -----------
+    const baseUrl = process.env.BASE_URL || "http://localhost:5000";
+    const signedPdfUrl = `${baseUrl}/signed/${signedFileName}`;
 
-    const finalW = imgW * scale;
-    const finalH = imgH * scale;
-
-    // Center inside the box
-    const xImg = xPt + (wBoxPt - finalW) / 2;
-    const yImg = yPt + (hBoxPt - finalH) / 2;
-
-    // 7️⃣ Draw image on page
-    page.drawImage(sigImage, {
-      x: xImg,
-      y: yImg,
-      width: finalW,
-      height: finalH,
-    });
-
-    // 8️⃣ Save modified PDF
-    const signedPdfBytes = await pdfDoc.save();
-
-    // 9️⃣ Hash the final PDF
-    const signedHash = crypto
-      .createHash("sha256")
-      .update(signedPdfBytes)
-      .digest("hex");
-
-    // 🔟 Store hashes in MongoDB (audit trail)
-    await Document.create({
-      pdfId,
-      originalHash,
-      signedHash,
-    });
-
-    // 1️⃣1️⃣ Save file to /signed
-    const fileName = `${pdfId}-${Date.now()}.pdf`;
-    const outputPath = path.join(__dirname, "..", "signed", fileName);
-    fs.writeFileSync(outputPath, signedPdfBytes);
-
-    const baseUrl = process.env.BASE_URL || `${req.protocol}://${req.get("host")}`;
-    const signedPdfUrl = `${baseUrl}/signed/${fileName}`;
+    console.log("🎉 PDF Signed Successfully:", signedPdfUrl);
 
     return res.json({
+      success: true,
       signedPdfUrl,
       originalHash,
-      signedHash,
+      signedHash
     });
-  } catch (err) {
-    console.error("signPdf error:", err);
-    return res.status(500).json({ message: "Internal server error" });
+
+  } catch (error) {
+    console.error("❌ SIGN ERROR", error);
+    res.status(500).json({ success: false, message: "Signing failed", error: error.message });
   }
 };
