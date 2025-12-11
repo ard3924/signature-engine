@@ -84,7 +84,7 @@ module.exports = async function signPdf(req, res) {
     fs.writeFileSync(signedPath, pdfBytes);
 
     // ----------- BUILD PUBLIC URL -----------
-    const baseUrl = process.env.BASE_URL || "http://localhost:5000";
+    const baseUrl = process.env.BASE_URL;
     const signedPdfUrl = `${baseUrl}/signed/${signedFileName}`;
 
     console.log("🎉 PDF Signed Successfully:", signedPdfUrl);
